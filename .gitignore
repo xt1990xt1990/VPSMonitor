@@ -1,0 +1,24 @@
+.DS_Store
+
+# Swift build output
+.build/
+.swiftpm/
+
+# Local app bundles and archives
+dist/
+*.app/
+*.dSYM/
+*.zip
+
+# Local configuration and secrets
+.env
+.env.*
+config.json
+*.local.json
+*.secret.json
+*.pem
+*.key
+*.p8
+
+# Logs
+*.log
