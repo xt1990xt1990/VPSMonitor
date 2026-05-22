@@ -63,6 +63,10 @@ open ~/Applications/VPSMonitor.app
 
 This repository intentionally ignores local configuration, build output, app bundles, archives, logs, and common private key files.
 
+## Acknowledgements
+
+Thanks to [Komari](https://github.com/komari-monitor/komari) for providing the lightweight self-hosted server monitoring platform and API that this menu bar client builds on.
+
 ## License
 
 MIT
