@@ -1,5 +1,7 @@
 # VPSMonitor
 
+[中文说明](README.zh-CN.md)
+
 A lightweight macOS menu bar monitor for Komari VPS nodes. It shows node health, CPU, memory, disk, network traffic, latency, loss, uptime, and expiry metadata from the menu bar.
 
 This app is a macOS menu bar client for [Komari](https://github.com/komari-monitor/komari), a lightweight self-hosted server monitoring tool. You need a running Komari server and API/session credentials for this app to display data.
