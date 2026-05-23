@@ -67,6 +67,8 @@ This repository intentionally ignores local configuration, build output, app bun
 
 Thanks to [Komari](https://github.com/komari-monitor/komari) for providing the lightweight self-hosted server monitoring platform and API that this menu bar client builds on.
 
+The popover card UI is inspired by [komari-theme-Lumina](https://github.com/stqfdyr/komari-theme-Lumina). Thanks to the Lumina theme author for the visual direction.
+
 ## License
 
 MIT
