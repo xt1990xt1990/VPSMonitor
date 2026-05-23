@@ -92,7 +92,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover?.performClose(nil)
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: MonitorPopoverLayout.contentWidth(nodeCount: 1), height: MonitorPopoverLayout.contentHeight)
+        popover.contentSize = NSSize(
+            width: MonitorPopoverLayout.contentWidth(nodeCount: 1),
+            height: MonitorPopoverLayout.contentHeight(nodeCount: 1)
+        )
         if let store {
             popover.contentViewController = NSHostingController(
                 rootView: MonitorPopover(
@@ -120,7 +123,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updatePopoverSize(_ nodes: [NodeViewModel]) {
         let width = MonitorPopoverLayout.contentWidth(nodeCount: nodes.count)
-        popover.contentSize = NSSize(width: width, height: MonitorPopoverLayout.contentHeight)
+        let height = MonitorPopoverLayout.contentHeight(nodeCount: nodes.count)
+        popover.contentSize = NSSize(width: width, height: height)
     }
 
     private func togglePopover() {
