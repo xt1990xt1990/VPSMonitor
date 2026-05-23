@@ -11,6 +11,7 @@ final class KomariStore: ObservableObject {
     private var nodeInfo: [String: NodeInfo] = [:]
     private var statuses: [String: NodeStatus] = [:]
     private var pings: [String: PingInfo] = [:]
+    private var homepagePingBindings: [String: Int] = [:]
     private var refreshTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
     private var statusPollTask: Task<Void, Never>?
@@ -37,16 +38,16 @@ final class KomariStore: ObservableObject {
                 }
             }
         }
-        pingTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(10))
-                await self?.refreshPing()
-            }
-        }
         statusPollTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(10))
-                await self?.pollStatusIfNeeded()
+                await self?.refreshLatestStatus()
+            }
+        }
+        pingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let interval = await self?.refreshHomepagePing() ?? 60
+                try? await Task.sleep(for: .seconds(interval))
             }
         }
     }
@@ -65,10 +66,16 @@ final class KomariStore: ObservableObject {
 
     private func bootstrap() async {
         do {
-            let fetchedNodes = try await client.fetchNodes()
+            async let fetchedNodesTask = client.fetchNodes()
+            async let bindingsTask = client.fetchHomepagePingBindings()
+            let fetchedNodes = try await fetchedNodesTask
+            homepagePingBindings = try await bindingsTask
             nodeInfo = Dictionary(uniqueKeysWithValues: fetchedNodes.map { ($0.id, $0) })
-            statuses = try await client.fetchLatestStatus(uuids: fetchedNodes.map(\.id))
-            pings = try await client.fetchPingSummary()
+            async let latestTask = client.fetchLatestStatus(uuids: fetchedNodes.map(\.id))
+            async let pingTask = client.fetchHomepagePingSummary(clients: fetchedNodes.map(\.id), bindings: homepagePingBindings)
+            let pingSummary = try await pingTask
+            statuses = try await latestTask
+            pings = pingSummary.items
             rebuild()
             lastError = nil
         } catch {
@@ -76,22 +83,33 @@ final class KomariStore: ObservableObject {
         }
     }
 
-    private func refreshPing() async {
+    private func refreshLatestStatus() async {
         do {
-            pings = try await client.fetchPingSummary()
+            let latest = try await client.fetchLatestStatus(uuids: Array(nodeInfo.keys))
+            for (uuid, status) in latest {
+                statuses[uuid] = connected ? statuses[uuid] ?? status : status
+            }
             rebuild()
         } catch {
             lastError = error.localizedDescription
         }
     }
 
-    private func pollStatusIfNeeded() async {
-        guard !connected else { return }
+    private func refreshHomepagePing() async -> TimeInterval {
+        guard !nodeInfo.isEmpty, !homepagePingBindings.isEmpty else {
+            return 2
+        }
         do {
-            statuses = try await client.fetchLatestStatus(uuids: Array(nodeInfo.keys))
+            let summary = try await client.fetchHomepagePingSummary(
+                clients: Array(nodeInfo.keys),
+                bindings: homepagePingBindings
+            )
+            pings = summary.items
             rebuild()
+            return summary.interval
         } catch {
             lastError = error.localizedDescription
+            return 60
         }
     }
 
@@ -198,36 +216,61 @@ final class KomariClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         return out
     }
 
-    func fetchPingSummary() async throws -> [String: PingInfo] {
-        let result = try await rpc(method: "common:getRecords", params: ["type": "ping", "hours": 1, "maxCount": 500])
-        guard let dict = result as? [String: Any] else { return [:] }
-        var out: [String: PingInfo] = [:]
-
-        for item in (dict["basic_info"] as? [[String: Any]] ?? dict["basicInfo"] as? [[String: Any]] ?? []) {
-            let client = string(item["client"])
-            guard !client.isEmpty else { continue }
-            out[client, default: PingInfo()].loss = number(item["loss"])
+    func fetchHomepagePingSummary(clients: [String], bindings: [String: Int]) async throws -> PingSummary {
+        let assignments = assignedPingTasks(clients: clients, bindings: bindings)
+        guard !assignments.isEmpty else {
+            return PingSummary(items: [:], interval: 60)
         }
 
-        var series: [String: [(Date, Double)]] = [:]
-        for record in dict["records"] as? [[String: Any]] ?? [] {
-            let client = string(record["client"])
-            guard !client.isEmpty else { continue }
-            let date = parseDate(record["time"]) ?? .distantPast
-            series[client, default: []].append((date, number(record["value"])))
-        }
+        let uniqueTasks = Array(Set(assignments.values)).sorted()
+        var items: [String: PingInfo] = [:]
+        var intervals: [TimeInterval] = []
 
-        for (client, points) in series {
-            let sorted = points.sorted { $0.0 < $1.0 }.suffix(18)
-            let values = sorted.map(\.1)
-            out[client, default: PingInfo()].latency = values.last
-            out[client, default: PingInfo()].latencies = values
-            out[client, default: PingInfo()].drops = values.map { $0 < 0 }
-            if out[client]?.loss == nil, !values.isEmpty {
-                out[client]?.loss = Double(values.filter { $0 < 0 }.count) / Double(values.count) * 100
+        for taskId in uniqueTasks {
+            let overview = try await fetchPingOverview(taskId: taskId)
+            intervals.append(overview.interval)
+            let taskItems = parsePingOverview(taskId: taskId, overview: overview)
+            for (client, assignedTaskId) in assignments where assignedTaskId == taskId {
+                items[client] = taskItems[client] ?? PingInfo()
             }
         }
-        return out
+
+        return PingSummary(
+            items: items,
+            interval: intervals.min() ?? 60
+        )
+    }
+
+    func fetchHomepagePingBindings() async throws -> [String: Int] {
+        guard let url = URL(string: config.baseURL + "/api/public") else { return [:] }
+        var request = URLRequest(url: url)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, _) = try await URLSession.shared.data(for: request)
+        let json = try JSONSerialization.jsonObject(with: data)
+        let root = json as? [String: Any]
+        let dataDict = root?["data"] as? [String: Any] ?? root
+        let settings = dataDict?["theme_settings"] as? [String: Any] ?? dataDict?["themeSettings"] as? [String: Any]
+        let bindings = settings?["homepagePingBindings"] as? [String: Any] ?? settings?["homepage_ping_bindings"] as? [String: Any]
+        return parseHomepagePingBindings(bindings)
+    }
+
+    private func fetchPingOverview(taskId: Int) async throws -> PingOverview {
+        let result = try await rpc(
+            method: "common:getRecords",
+            params: [
+                "type": "ping",
+                "hours": 1,
+                "task_id": taskId,
+                "maxCount": 4000
+            ]
+        )
+        let dict = result as? [String: Any] ?? [:]
+        let records = unwrapList(dict["records"] ?? dict)
+        let tasks = unwrapList(dict["tasks"] as Any)
+        let interval = tasks
+            .first { Int(number($0["id"])) == taskId }
+            .map { normalizedPingInterval(number($0["interval"])) } ?? 60
+        return PingOverview(records: records, interval: interval)
     }
 
     func connectWebSocket(onMessage: @escaping @Sendable (Data) -> Void, onClose: @escaping @Sendable (String?) -> Void) async {
@@ -358,6 +401,88 @@ func unwrapList(_ value: Any) -> [[String: Any]] {
         }
     }
     return []
+}
+
+struct PingSummary {
+    var items: [String: PingInfo]
+    var interval: TimeInterval
+}
+
+private struct PingOverview {
+    var records: [[String: Any]]
+    var interval: TimeInterval
+}
+
+private struct PingRecord {
+    var time: Date
+    var value: Double
+}
+
+func parseHomepagePingBindings(_ raw: Any?) -> [String: Int] {
+    guard let dict = raw as? [String: Any] else { return [:] }
+    var bindings: [String: Int] = [:]
+    let taskEntries = dict.compactMap { taskKey, clientsRaw -> (Int, Any)? in
+        guard let taskId = Int(taskKey), taskId > 0 else { return nil }
+        return (taskId, clientsRaw)
+    }.sorted { $0.0 < $1.0 }
+
+    for (taskId, clientsRaw) in taskEntries {
+        let clients: [String]
+        if let list = clientsRaw as? [String] {
+            clients = list
+        } else if let list = clientsRaw as? [Any] {
+            clients = list.compactMap { string($0).isEmpty ? nil : string($0) }
+        } else {
+            continue
+        }
+        for client in clients where bindings[client] == nil {
+            bindings[client] = taskId
+        }
+    }
+    return bindings
+}
+
+func assignedPingTasks(clients: [String], bindings: [String: Int]) -> [String: Int] {
+    let clientSet = Set(clients)
+    var assignments: [String: Int] = [:]
+    for (client, taskId) in bindings where clientSet.contains(client) && taskId > 0 {
+        assignments[client] = taskId
+    }
+    return assignments
+}
+
+private func parsePingOverview(taskId: Int, overview: PingOverview) -> [String: PingInfo] {
+    var grouped: [String: [PingRecord]] = [:]
+    for record in overview.records {
+        guard Int(number(record["task_id"])) == taskId else { continue }
+        let client = string(record["client"])
+        guard !client.isEmpty else { continue }
+        grouped[client, default: []].append(
+            PingRecord(
+                time: parseDate(record["time"]) ?? .distantPast,
+                value: number(record["value"])
+            )
+        )
+    }
+
+    var items: [String: PingInfo] = [:]
+    for (client, records) in grouped {
+        let values = records.sorted { $0.time < $1.time }.map(\.value)
+        let lost = values.filter { $0 <= 0 }.count
+        let latest = values.last.flatMap { $0 > 0 ? $0 : nil }
+        items[client] = PingInfo(
+            latency: latest,
+            loss: values.isEmpty ? nil : Double(lost) / Double(values.count) * 100,
+            latencies: values.map { $0 > 0 ? $0 : -1 },
+            drops: values.map { $0 <= 0 }
+        )
+    }
+    return items
+}
+
+private func normalizedPingInterval(_ seconds: Double) -> TimeInterval {
+    guard seconds.isFinite, seconds > 0 else { return 60 }
+    return min(300, max(10, seconds))
 }
 
 func parseNodeInfo(_ raw: [String: Any]) -> NodeInfo? {
