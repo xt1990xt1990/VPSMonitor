@@ -72,7 +72,10 @@ final class KomariStore: ObservableObject {
             homepagePingBindings = try await bindingsTask
             nodeInfo = Dictionary(uniqueKeysWithValues: fetchedNodes.map { ($0.id, $0) })
             async let latestTask = client.fetchLatestStatus(uuids: fetchedNodes.map(\.id))
-            async let pingTask = client.fetchHomepagePingSummary(clients: fetchedNodes.map(\.id), bindings: homepagePingBindings)
+            async let pingTask = client.fetchHomepagePingSummary(
+                clients: fetchedNodes.map(\.id),
+                bindings: homepagePingBindings
+            )
             let pingSummary = try await pingTask
             statuses = try await latestTask
             pings = pingSummary.items
@@ -97,7 +100,7 @@ final class KomariStore: ObservableObject {
 
     private func refreshHomepagePing() async -> TimeInterval {
         guard !nodeInfo.isEmpty, !homepagePingBindings.isEmpty else {
-            return 2
+            return 60
         }
         do {
             let summary = try await client.fetchHomepagePingSummary(
@@ -115,28 +118,8 @@ final class KomariStore: ObservableObject {
 
     private func applyRealtime(_ data: Data) {
         guard let payload = try? JSONSerialization.jsonObject(with: data) else { return }
-        let records: [[String: Any]]
-        if let list = payload as? [[String: Any]] {
-            records = list
-        } else if let dict = payload as? [String: Any], let list = dict["clients"] as? [[String: Any]] {
-            records = list
-        } else if let dict = payload as? [String: Any], let list = dict["data"] as? [[String: Any]] {
-            records = list
-        } else if let dict = payload as? [String: Any],
-                  let wrapper = dict["data"] as? [String: Any],
-                  let map = wrapper["data"] as? [String: [String: Any]] {
-            let online = Set(wrapper["online"] as? [String] ?? [])
-            records = map.map { uuid, status in
-                var copy = status
-                copy["uuid"] = uuid
-                copy["online"] = online.contains(uuid)
-                return copy
-            }
-        } else if let dict = payload as? [String: Any] {
-            records = [dict]
-        } else {
-            return
-        }
+        let records = realtimeRecords(from: payload)
+        guard !records.isEmpty else { return }
 
         for record in records {
             let uuid = string(record["uuid"]).isEmpty ? string(record["client"]) : string(record["uuid"])
@@ -245,6 +228,7 @@ final class KomariClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         guard let url = URL(string: config.baseURL + "/api/public") else { return [:] }
         var request = URLRequest(url: url)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyAuth(to: &request)
         let (data, _) = try await URLSession.shared.data(for: request)
         let json = try JSONSerialization.jsonObject(with: data)
         let root = json as? [String: Any]
@@ -403,6 +387,49 @@ func unwrapList(_ value: Any) -> [[String: Any]] {
     return []
 }
 
+func realtimeRecords(from payload: Any) -> [[String: Any]] {
+    RealtimePayloadParser.records(from: payload)
+}
+
+enum RealtimePayloadParser {
+    static func records(from payload: Any) -> [[String: Any]] {
+        if let list = payload as? [[String: Any]] {
+            return list
+        }
+        guard let dict = payload as? [String: Any] else {
+            return []
+        }
+        if let list = dict["clients"] as? [[String: Any]] {
+            return list
+        }
+        if let list = dict["data"] as? [[String: Any]] {
+            return list
+        }
+        if let map = dict["data"] as? [String: [String: Any]] {
+            return records(fromMap: map, online: dict["online"] as? [String])
+        }
+        if let wrapper = dict["data"] as? [String: Any],
+           let map = wrapper["data"] as? [String: [String: Any]] {
+            return records(fromMap: map, online: wrapper["online"] as? [String])
+        }
+        if dict["uuid"] != nil || dict["client"] != nil {
+            return [dict]
+        }
+        return []
+    }
+
+    private static func records(fromMap map: [String: [String: Any]], online: [String]?) -> [[String: Any]] {
+        let online = Set(online ?? [])
+        return map.map { uuid, status in
+            var copy = status
+            copy["uuid"] = copy["uuid"] ?? uuid
+            copy["client"] = copy["client"] ?? uuid
+            copy["online"] = copy["online"] ?? online.contains(uuid)
+            return copy
+        }
+    }
+}
+
 struct PingSummary {
     var items: [String: PingInfo]
     var interval: TimeInterval
@@ -419,7 +446,8 @@ private struct PingRecord {
 }
 
 func parseHomepagePingBindings(_ raw: Any?) -> [String: Int] {
-    guard let dict = raw as? [String: Any] else { return [:] }
+    let rawBindings = unwrapPingBindingPayload(raw)
+    guard let dict = rawBindings as? [String: Any] else { return [:] }
     var bindings: [String: Int] = [:]
     let taskEntries = dict.compactMap { taskKey, clientsRaw -> (Int, Any)? in
         guard let taskId = Int(taskKey), taskId > 0 else { return nil }
@@ -427,19 +455,33 @@ func parseHomepagePingBindings(_ raw: Any?) -> [String: Int] {
     }.sorted { $0.0 < $1.0 }
 
     for (taskId, clientsRaw) in taskEntries {
-        let clients: [String]
-        if let list = clientsRaw as? [String] {
-            clients = list
-        } else if let list = clientsRaw as? [Any] {
-            clients = list.compactMap { string($0).isEmpty ? nil : string($0) }
-        } else {
-            continue
-        }
+        let clients = stringArray(clientsRaw)
         for client in clients where bindings[client] == nil {
             bindings[client] = taskId
         }
     }
     return bindings
+}
+
+private func unwrapPingBindingPayload(_ raw: Any?) -> Any? {
+    guard let dict = raw as? [String: Any] else { return raw }
+    for key in ["homepagePingBindings", "homepage_ping_bindings", "theme_settings", "themeSettings", "data", "result"] where dict[key] != nil {
+        return unwrapPingBindingPayload(dict[key])
+    }
+    return raw
+}
+
+private func stringArray(_ raw: Any?) -> [String] {
+    if let list = raw as? [String] {
+        return list.filter { !$0.isEmpty }
+    }
+    if let list = raw as? [Any] {
+        return list.compactMap {
+            let value = string($0)
+            return value.isEmpty ? nil : value
+        }
+    }
+    return []
 }
 
 func assignedPingTasks(clients: [String], bindings: [String: Int]) -> [String: Int] {
@@ -452,8 +494,12 @@ func assignedPingTasks(clients: [String], bindings: [String: Int]) -> [String: I
 }
 
 private func parsePingOverview(taskId: Int, overview: PingOverview) -> [String: PingInfo] {
+    parsePingRecords(taskId: taskId, records: overview.records)
+}
+
+func parsePingRecords(taskId: Int, records: [[String: Any]]) -> [String: PingInfo] {
     var grouped: [String: [PingRecord]] = [:]
-    for record in overview.records {
+    for record in records {
         guard Int(number(record["task_id"])) == taskId else { continue }
         let client = string(record["client"])
         guard !client.isEmpty else { continue }

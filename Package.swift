@@ -16,6 +16,11 @@ let package = Package(
             resources: [
                 .process("KomariLogo.png")
             ]
+        ),
+        .testTarget(
+            name: "KomariMonitorTests",
+            dependencies: ["KomariMonitor"],
+            path: "Tests/KomariMonitorTests"
         )
     ]
 )

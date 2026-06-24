@@ -3,17 +3,17 @@ import AppKit
 import SwiftUI
 
 enum MonitorPopoverLayout {
-    static let maxWidth: CGFloat = 1_060
+    static let maxWidth: CGFloat = 1_460
     static let minWidth: CGFloat = 360
     static let cardMinWidth: CGFloat = 318
     static let cardExpandedWidth: CGFloat = 340
     static let cardBaseHeight: CGFloat = 394
     static let cardSpacing: CGFloat = 10
     static let chromeHeight: CGFloat = 104
+    static let cardAreaPadding: CGFloat = 20
 
     static func contentWidth(nodeCount: Int) -> CGFloat {
         let count = max(1, nodeCount)
-        let availableWidth = max(minWidth, min(maxWidth, (NSScreen.main?.visibleFrame.width ?? maxWidth) - 80))
         let columns = columnCount(nodeCount: count)
         let cardWidth = displayCardWidth(nodeCount: count)
         let ideal = CGFloat(columns) * cardWidth
@@ -28,11 +28,14 @@ enum MonitorPopoverLayout {
         let ideal = chromeHeight
             + CGFloat(rows) * displayCardHeight(nodeCount: count)
             + CGFloat(max(0, rows - 1)) * cardSpacing
+            + cardAreaPadding
         return min(availableHeight, max(360, ideal))
     }
 
     static func columnCount(nodeCount: Int) -> Int {
-        min(max(1, nodeCount), 3)
+        let count = max(1, nodeCount)
+        let maxColumnsByWidth = Int((availableWidth - 28 + cardSpacing) / (cardExpandedWidth + cardSpacing))
+        return min(count, 4, max(1, maxColumnsByWidth))
     }
 
     static func rowCount(nodeCount: Int) -> Int {
@@ -41,12 +44,7 @@ enum MonitorPopoverLayout {
     }
 
     static func cardScale(nodeCount: Int) -> CGFloat {
-        let count = max(1, nodeCount)
-        guard count > 3 else { return 1 }
-        let rows = rowCount(nodeCount: count)
-        let rowGaps = CGFloat(max(0, rows - 1)) * cardSpacing
-        let fitScale = (availableHeight - chromeHeight - rowGaps) / (CGFloat(rows) * cardBaseHeight)
-        return min(0.86, max(0.68, fitScale))
+        1
     }
 
     static func displayCardWidth(nodeCount: Int) -> CGFloat {
@@ -57,8 +55,12 @@ enum MonitorPopoverLayout {
         cardBaseHeight * cardScale(nodeCount: nodeCount)
     }
 
+    private static var availableWidth: CGFloat {
+        max(minWidth, min(maxWidth, (NSScreen.main?.visibleFrame.width ?? maxWidth) - 48))
+    }
+
     private static var availableHeight: CGFloat {
-        max(430, min(820, (NSScreen.main?.visibleFrame.height ?? 820) - 80))
+        max(430, min(980, (NSScreen.main?.visibleFrame.height ?? 980) - 48))
     }
 }
 
@@ -111,22 +113,25 @@ struct MonitorPopover: View {
     }
 
     private var cards: some View {
-        LazyVGrid(
-            columns: Array(
-                repeating: GridItem(.fixed(displayedCardWidth), spacing: MonitorPopoverLayout.cardSpacing, alignment: .top),
-                count: MonitorPopoverLayout.columnCount(nodeCount: store.nodes.count)
-            ),
-            alignment: .leading,
-            spacing: MonitorPopoverLayout.cardSpacing
-        ) {
-            ForEach(store.nodes) { item in
-                NodeCard(item: item)
-                    .frame(width: MonitorPopoverLayout.cardExpandedWidth, alignment: .topLeading)
-                    .scaleEffect(cardScale, anchor: .topLeading)
-                    .frame(width: displayedCardWidth, height: displayedCardHeight, alignment: .topLeading)
+        ScrollView(.vertical) {
+            LazyVGrid(
+                columns: Array(
+                    repeating: GridItem(.fixed(displayedCardWidth), spacing: MonitorPopoverLayout.cardSpacing, alignment: .top),
+                    count: MonitorPopoverLayout.columnCount(nodeCount: store.nodes.count)
+                ),
+                alignment: .leading,
+                spacing: MonitorPopoverLayout.cardSpacing
+            ) {
+                ForEach(store.nodes) { item in
+                    NodeCard(item: item)
+                        .frame(width: MonitorPopoverLayout.cardExpandedWidth, alignment: .topLeading)
+                        .scaleEffect(cardScale, anchor: .topLeading)
+                        .frame(width: displayedCardWidth, height: displayedCardHeight, alignment: .topLeading)
+                }
             }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .padding(10)
         .background(Theme.luminaShellBody)
         .frame(maxWidth: .infinity, alignment: .topLeading)
     }

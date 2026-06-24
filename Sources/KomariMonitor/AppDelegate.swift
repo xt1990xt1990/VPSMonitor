@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import SwiftUI
 
 enum StatusColors {
@@ -7,7 +8,12 @@ enum StatusColors {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+    private enum PopoverFade {
+        static let fadeInDuration: TimeInterval = 0.07
+        static let fadeOutDuration: TimeInterval = 0.20
+    }
+
     private static let statusIconWidth: CGFloat = 14
     private static let statusGap: CGFloat = 4
     private var statusItem: NSStatusItem!
@@ -17,6 +23,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var popover: NSPopover!
     private var settingsWindow: NSWindow?
     private var nodeObservationTask: Task<Void, Never>?
+    private var appDeactivationObserver: NSObjectProtocol?
+    private var outsideClickMonitor: Any?
+    private var localClickMonitor: Any?
+    private var localKeyMonitor: Any?
+    private var isClosingPopover = false
     private var store: KomariStore?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -32,6 +43,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stopOutsideClickMonitoring()
+        stopAppDeactivationMonitoring()
         nodeObservationTask?.cancel()
         store?.stop()
     }
@@ -90,8 +103,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configurePopover(store: KomariStore?) {
         popover?.performClose(nil)
+        stopOutsideClickMonitoring()
+        stopAppDeactivationMonitoring()
         popover = NSPopover()
-        popover.behavior = .transient
+        popover.delegate = self
+        popover.behavior = .applicationDefined
+        popover.animates = false
         popover.contentSize = NSSize(
             width: MonitorPopoverLayout.contentWidth(nodeCount: 1),
             height: MonitorPopoverLayout.contentHeight(nodeCount: 1)
@@ -130,10 +147,141 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func togglePopover() {
         guard let button = statusItem.button else { return }
         if popover.isShown {
-            popover.performClose(nil)
+            closePopoverLightly()
         } else {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            showPopoverLightly(relativeTo: button.bounds, of: button)
         }
+    }
+
+    private func showPopoverLightly(relativeTo rect: NSRect, of button: NSView) {
+        isClosingPopover = false
+        guard let contentController = popover.contentViewController else { return }
+        contentController.view.alphaValue = 0
+        popover.show(relativeTo: rect, of: button, preferredEdge: .minY)
+
+        guard let window = contentController.view.window else {
+            contentController.view.alphaValue = 1
+            startOutsideClickMonitoring()
+            return
+        }
+
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = true
+        window.alphaValue = 0
+        window.makeFirstResponder(contentController.view)
+        window.makeKey()
+        contentController.view.alphaValue = 1
+        startOutsideClickMonitoring()
+        startAppDeactivationMonitoring()
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = PopoverFade.fadeInDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().alphaValue = 1
+        }
+    }
+
+    private func closePopoverLightly() {
+        guard popover.isShown, !isClosingPopover else { return }
+        isClosingPopover = true
+
+        guard let window = popover.contentViewController?.view.window else {
+            popover.performClose(nil)
+            return
+        }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = PopoverFade.fadeOutDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.popover.performClose(nil)
+            }
+        }
+    }
+
+    private func startOutsideClickMonitoring() {
+        stopOutsideClickMonitoring()
+
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            Task { @MainActor in
+                self?.closePopoverLightly()
+            }
+        }
+
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+            guard let self, self.popover.isShown else { return event }
+            if self.isStatusButtonClick(event) {
+                return event
+            }
+            guard let popoverWindow = self.popover.contentViewController?.view.window else {
+                self.closePopoverLightly()
+                return event
+            }
+            if event.window !== popoverWindow {
+                self.closePopoverLightly()
+            }
+            return event
+        }
+
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.popover.isShown, event.keyCode == 53 else { return event }
+            self.closePopoverLightly()
+            return nil
+        }
+    }
+
+    private func stopOutsideClickMonitoring() {
+        if let outsideClickMonitor {
+            NSEvent.removeMonitor(outsideClickMonitor)
+            self.outsideClickMonitor = nil
+        }
+        if let localClickMonitor {
+            NSEvent.removeMonitor(localClickMonitor)
+            self.localClickMonitor = nil
+        }
+        if let localKeyMonitor {
+            NSEvent.removeMonitor(localKeyMonitor)
+            self.localKeyMonitor = nil
+        }
+    }
+
+    private func startAppDeactivationMonitoring() {
+        stopAppDeactivationMonitoring()
+        appDeactivationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: NSApp,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.closePopoverLightly()
+            }
+        }
+    }
+
+    private func stopAppDeactivationMonitoring() {
+        if let appDeactivationObserver {
+            NotificationCenter.default.removeObserver(appDeactivationObserver)
+            self.appDeactivationObserver = nil
+        }
+    }
+
+    private func isStatusButtonClick(_ event: NSEvent) -> Bool {
+        guard let button = statusItem.button, event.window === button.window else { return false }
+        let location = button.convert(event.locationInWindow, from: nil)
+        return button.bounds.contains(location)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        isClosingPopover = false
+        popover.contentViewController?.view.window?.alphaValue = 1
+        popover.contentViewController?.view.alphaValue = 1
+        stopOutsideClickMonitoring()
+        stopAppDeactivationMonitoring()
     }
 
     private func showConfigError(_ error: Error) {
